@@ -37,10 +37,9 @@ namespace HttpServerSearcher {
                 Console.WriteLine("No polling addresses found.");
             }
             Console.WriteLine("{0} addresses will be polled...", addresses.Count);
-            PingFilter pf = new PingFilter(addresses);
-            addresses = pf.Start();
+            addresses = IcmpCheck(addresses);
             Console.WriteLine("{0} hosts available for check...", addresses.Count);
-            addresses = ServerFilter(addresses);
+            addresses = HttpCheck(addresses);
          }
 
         public static List<IPAddress> GetIPAddresses() {
@@ -141,55 +140,41 @@ namespace HttpServerSearcher {
             return listAddresses;
         }
 
-       class PingFilter {
-            private List<IPAddress> beforeAdresses;
-            private List<IPAddress> afterAdresses;
-            private AutoResetEvent waiter;
-            CountdownEvent cde;
-            public PingFilter(List<IPAddress> addresses) {
-                if (addresses == null) throw new ArgumentNullException(nameof(addresses));
-                //if (initalCount < 0) throw new ArgumentOutOfRangeException("initialCount is less than 0.");
-                waiter = new AutoResetEvent (true);
-                cde = new CountdownEvent(addresses.Count);
-                beforeAdresses = addresses;
-                afterAdresses = new List<IPAddress>();
-            }
-        
-            public List<IPAddress> Start() {
-                int timeout = 120;
-                foreach(IPAddress address in beforeAdresses) {
-                    Ping ping = new Ping();
-                    ping.PingCompleted += (sender, e) => {
-                        PingFilter pf = (PingFilter)e.UserState;
-                        pf.waiter.WaitOne();
-                        if (e.Reply.Status == IPStatus.Success) {
-                            Console.WriteLine("Ping successed on IP: {0} Time: {1} ms", e.Reply.Address, e.Reply.RoundtripTime);
-                            pf.afterAdresses.Add(e.Reply.Address);
+        public static List<IPAddress> IcmpCheck(List<IPAddress> addresses, int timeout = 100, bool verbose = false) {
+            //if(addresses == null) throw new ArgumentNullException(nameof(addresses));
+            //if(timeout < 0) throw new ArgumentOutOfRangeException("timeout is less than 0.");
+            List<IPAddress> replied = new List<IPAddress>();
+            CountdownEvent cde = new CountdownEvent(addresses.Count);;
+            object addressesLock = new object();
+            foreach(IPAddress address in addresses) {
+                Ping ping = new Ping();
+                ping.PingCompleted += (sender, e) => {
+                    if(e.Cancelled) {
+                        Console.WriteLine("{0} ping canceled.", e.UserState);
+                    } else if(e.Error != null) {
+                        Console.WriteLine("{0} ping error: {1}", e.UserState, e.Error.ToString());
+                    } else if(e.Reply.Status == IPStatus.Success) {
+                        Console.WriteLine("{0} ping time is {1} ms", e.Reply.Address, e.Reply.RoundtripTime);
+                        lock(addressesLock) {
+                            replied.Add(e.Reply.Address);
                         }
-                        // Console.Write("Pinged {0}/{1}, available {2}", cde.CurrentCount, cde.InitialCount, afterAdresses.Count);
-                        //Console.CursorLeft = 0;
-                        // Let the main thread resume.
-                        pf.cde.Signal();
-                        pf.waiter.Set();
-                    };
-                    ping.SendAsync(address, timeout, this);//, cde);
-/*
-PingReply pingReply = ping.Send(address, timeout);
-if(pingReply.Status == IPStatus.Success) {
-    Console.WriteLine("Ping successed on IP: {0} Time: {1} ms", pingReply.Address, pingReply.RoundtripTime);
-    afterAdresses.Add(pingReply.Address);
-}
-*/
-                }
-                // And wait for queue to empty by waiting on cde
-                cde.Wait(); // will return when cde count reaches 0
-                // It's good to release a CountdownEvent when you're done with it.
-                //cde.Dispose();
-                Console.WriteLine();
-                return afterAdresses;
+                    } else if(e.Reply.Status != IPStatus.TimedOut) {
+                         Console.WriteLine("{0} ping failed: {1}", e.UserState, e.Reply.Status);
+                    }
+                    // Let the main thread resume.
+                    cde.Signal();
+                };
+                ping.SendAsync(address, timeout, address);
             }
+            // And wait for queue to empty by waiting on cde
+            cde.Wait(); // will return when cde count reaches 0
+            // It's good to release a CountdownEvent when you're done with it.
+            //cde.Dispose();
+            Console.WriteLine();
+            return replied;
         }
-        public static List<IPAddress> ServerFilter(List<IPAddress> addresses) {
+
+        public static List<IPAddress> HttpCheck(List<IPAddress> addresses) {
             List<IPAddress> serverAddresses = new List<IPAddress>();
             Dictionary<string, string> HeaderList = new Dictionary<string, string>();
             string url;
