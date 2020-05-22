@@ -18,8 +18,12 @@ where
 
 ## Usage
 ```sh
-HttpServerSearcher
+HttpServerSearcher [-t <TIMEOUT>] [-v]
 ```
+where
+* -t - specifies ICMP/HTTP requests timeout, at millisecond (Default: 100).
+* -v - specifies operate in verbose mode.
+
 ## How it works
  1. Gets the network interfaces in the system
  2. Gets the host IP addresses on Ethernet networks
@@ -29,13 +33,8 @@ HttpServerSearcher
  7. Displays the IP addresses of devices and the contents of the HTTP "Server" header of their response
 
 ## Roadmap
-* Passing arguments from the command line (this version not accept command line arguments)
-* Silent operation. Only the IP addresses of the found servers and the contents of their headers are output(this version verbose)
 * Scan user-specified IP addresses (this version scan all available local networks)
-* User-specified ICMP/HTTP request timeout (in this version 100/100000 millisecond)
 * Filter HTTP servers by header content (this version displays servers whose response has the HTTP header "Server", content no metter)
 * Support IPv6(maybe)
-
-> Sorry for my bad English
 
 [.NET Core]: https://dotnet.microsoft.com/download
