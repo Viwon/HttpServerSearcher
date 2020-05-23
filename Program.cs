@@ -9,6 +9,9 @@ using CommandLine;
 
 namespace HttpServerSearcher {
     class Program {
+        const int ThreadsLimit = 50;
+
+        public static bool IsVerbose = false;
 
         // Define a class to receive parsed values
         class Options {
@@ -26,8 +29,6 @@ namespace HttpServerSearcher {
 */
         }
 
-        static bool Verbose;
-
         static void Main(string[] args) {
             //var a = "-v".Split();
             Options settings = null;
@@ -37,7 +38,7 @@ namespace HttpServerSearcher {
             if(parse is NotParsed<Options>) {
                 return;
             }
-            Verbose = settings.Verbose;
+            IsVerbose = settings.Verbose;
 
             List<IPAddress> addresses = GetIPAddresses();
             var totalIPs = addresses.Count;
@@ -155,33 +156,42 @@ namespace HttpServerSearcher {
             //if(addresses == null) throw new ArgumentNullException(nameof(addresses));
             //if(timeout < 0) throw new ArgumentOutOfRangeException("timeout is less than 0.");
             List<IPAddress> replied = new List<IPAddress>();
-            CountdownEvent cde = new CountdownEvent(addresses.Count);;
-            object addressesLock = new object();
+            object repliedLock = new object();
+            int remainingAddresses = addresses.Count;
             WriteLine("{0} addresses will be polled...", addresses.Count);
+            Semaphore pool = new Semaphore(ThreadsLimit, ThreadsLimit);
             foreach(IPAddress address in addresses) {
+                pool.WaitOne();
                 Ping ping = new Ping();
                 ping.PingCompleted += (sender, e) => {
+                    bool success = false;
                     if(e.Cancelled) {
                         WriteLine("{0} ping canceled.", e.UserState);
                     } else if(e.Error != null) {
                         WriteLine("{0} ping error: {1}", e.UserState, e.Error.ToString());
                     } else if(e.Reply.Status == IPStatus.Success) {
                         WriteLine("{0} ping time is {1} ms", e.Reply.Address, e.Reply.RoundtripTime);
-                        lock(addressesLock) {
-                            replied.Add(e.Reply.Address);
-                        }
+                        success = true;
                     } else if(e.Reply.Status != IPStatus.TimedOut) {
                          WriteLine("{0} ping failed: {1}", e.UserState, e.Reply.Status);
                     }
+                    lock(repliedLock) {
+                        remainingAddresses--;
+                        if(success) replied.Add(e.Reply.Address);
+                    }
                     // Let the main thread resume.
-                    cde.Signal();
+                    pool.Release();
                 };
                 ping.SendAsync(address, timeout, address);
             }
-            // And wait for queue to empty by waiting on cde
-            cde.Wait(); // will return when cde count reaches 0
-            // It's good to release a CountdownEvent when you're done with it.
-            //cde.Dispose();
+            bool waitRemaining;
+            do {
+                pool.WaitOne();
+                lock(repliedLock) {
+                    waitRemaining = (remainingAddresses != 0);
+                }
+            } while(waitRemaining);
+            pool.Dispose();
             WriteLine();
             return replied;
         }
@@ -224,7 +234,7 @@ namespace HttpServerSearcher {
          }
 
         static void WriteLine(string format = null, params object[] arg) {
-            if(Verbose) {
+            if(IsVerbose) {
                 if(format != null) {
                     Console.WriteLine(format, arg);
                 } else {
