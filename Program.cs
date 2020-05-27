@@ -4,18 +4,20 @@ using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Threading;
-using System.Linq;
+using System.Linq;// .ToList()
 using CommandLine;
 
 namespace HttpServerSearcher {
     class Program {
-        const int ThreadsLimit = 50;
 
+        const int ThreadsLimit = 50;
+        const int BufferSize = 256;
         public static bool IsVerbose = false;
+        public static int Timeout = 100;
 
         // Define a class to receive parsed values
         class Options {
-            [Option('v', "verbose", HelpText = "Verbose operation.")]
+            [Option('v', "verbose", Default = false, HelpText = "Verbose operation.")]
             public bool Verbose { get; set; }
 
             [Option('t', "timeout", Default = 100, HelpText = "ICMP/HTTP request timeout, millisecond.")]
@@ -38,16 +40,20 @@ namespace HttpServerSearcher {
             if(parse is NotParsed<Options>) {
                 return;
             }
+
             IsVerbose = settings.Verbose;
+            Timeout = settings.Timeout;
 
             List<IPAddress> addresses = GetIPAddresses();
+            //List<IPAddress> addresses = new List<IPAddress>();
+            //addresses.Add(IPAddress.Parse("172.16.0.1"));
             var totalIPs = addresses.Count;
             if(totalIPs == 0) {
                 Console.WriteLine("No polling addresses found.");
                 return;
             }
-            addresses = IcmpCheck(addresses, settings.Timeout);
-            var serverList = HttpCheck(addresses, settings.Timeout);
+            addresses = IcmpCheck(addresses);
+            var serverList = HttpCheck(addresses);
             Console.WriteLine("{0} IP addresses were polled/ {1} replied to the ICMP-request/ {2} responded to the HTTP-request.", totalIPs, addresses.Count, serverList.Count);
             foreach(KeyValuePair<string, string> server in serverList) {
                 Console.WriteLine("http://{0}: {1}", server.Key, server.Value);
@@ -152,7 +158,7 @@ namespace HttpServerSearcher {
             return listAddresses;
         }
 
-        public static List<IPAddress> IcmpCheck(List<IPAddress> addresses, int timeout = 100) {
+        public static List<IPAddress> IcmpCheck(List<IPAddress> addresses) {
             //if(addresses == null) throw new ArgumentNullException(nameof(addresses));
             //if(timeout < 0) throw new ArgumentOutOfRangeException("timeout is less than 0.");
             List<IPAddress> replied = new List<IPAddress>();
@@ -182,7 +188,7 @@ namespace HttpServerSearcher {
                     // Let the main thread resume.
                     pool.Release();
                 };
-                ping.SendAsync(address, timeout, address);
+                ping.SendAsync(address, Timeout, address);
             }
             bool waitRemaining;
             do {
@@ -196,41 +202,94 @@ namespace HttpServerSearcher {
             return replied;
         }
 
-        public static Dictionary<string, string> HttpCheck(List<IPAddress> addresses, int timeout = 100) {
+        public static Dictionary<string, string> HttpCheck(List<IPAddress> addresses) {
             Dictionary<string, string> serverList = new Dictionary<string, string>();
-            string url;
+            string request;
+            byte[] recievedBytes = new byte[BufferSize];
+            byte[] headerBytes = new byte[BufferSize];
+            IPEndPoint endPoint = new IPEndPoint(0, 80);
             WriteLine("{0} addresses addresses will be checked on HTTP...", addresses.Count);
             foreach (IPAddress address in addresses) {
-                url = "http://" + address.ToString();
-                HttpWebRequest WebRequestObject = (HttpWebRequest)HttpWebRequest.Create(url);
-                //WebRequestObject.Method = "HEAD";
-                WebRequestObject.KeepAlive = false;
-                WebRequestObject.Timeout = timeout;
-                HttpWebResponse ResponseObject = null;
+                WriteLine($"{address}:");
+                request = String.Format("{0} / HTTP/1.1\r\nHost: {1}\r\nConnection: close\r\n\r\n", "GET", address);
+                endPoint.Address = address;
+                Socket socket = null;
+                string startLine = null;
+                Dictionary<string, string> headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                 try {
-                    ResponseObject = (HttpWebResponse)WebRequestObject.GetResponse();
-                } catch (WebException ex) {
-                    WriteLine("{0} {1}", url, ex.Message);
-                    continue;
+                    // Connect to host
+                    socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                    socket.Connect(endPoint);
+                    socket.SendTimeout = Timeout;
+                    socket.ReceiveTimeout = Timeout;
+                    // Send request
+                    socket.Send(System.Text.Encoding.ASCII.GetBytes(request));
+                    // Get response
+                    bool endOfHeaders = false;// Message header has received
+                    bool wsFlag = false;//  Current byte is White Space
+                    bool crFlag = false;// Current byte is Carriage Return
+                    bool lfFlag = false;// Current byte is LineFeed
+                    bool ctlFlag = false;// Current byte is control character
+                    bool prevLfFlag = false;// Previous byte is LineFeed
+                    int headerLen = 0;
+                    do {
+                        int total = socket.Receive(recievedBytes);
+                        for(int i = 0; i < total; i++) {
+                            wsFlag = recievedBytes[i] == ' ' || recievedBytes[i] == '\t';
+                            crFlag = recievedBytes[i] == '\r';
+                            lfFlag = recievedBytes[i] == '\n';
+                            ctlFlag = (recievedBytes[i] >= 0 && recievedBytes[i] <= 31) || recievedBytes[i] == 127;
+                            if(ctlFlag && !(crFlag || lfFlag)) {
+                                //throw new WebException(null, null, WebExceptionStatus.ServerProtocolViolation, null);
+                            }
+                            // If the line starts with a space, this is a multi-line header, skip to the true end
+                            if(prevLfFlag && !wsFlag) {
+                                if(headerLen == 0) {
+                                    endOfHeaders = true;
+                                    break;
+                                }
+                                string line = System.Text.Encoding.ASCII.GetString(headerBytes, 0, headerLen);
+                                WriteLine($"  {line}");
+                                headerLen = 0;
+                                if(startLine == null) {
+                                    startLine = line;
+                                } else {
+                                    int colonPos = line.IndexOf(':');
+                                    if(colonPos == -1) {
+                                        //throw new WebException(null, null, WebExceptionStatus.ServerProtocolViolation, null);
+                                    } else {
+                                        string name = line.Substring(0, colonPos).Trim();
+                                        string value = line.Substring(colonPos + 1).Trim();
+                                        
+                                        if(headers.ContainsKey(name)) {// multiple header
+                                            headers[name] += "," + value;
+                                        } else {
+                                            headers.Add(name, value);
+                                        }
+                                    }
+                                }
+                            }
+                            if(!ctlFlag) {
+                                headerBytes[headerLen++] = recievedBytes[i];
+                            }
+                            if(headerLen >= headerBytes.Count()) {
+                                Array.Resize(ref headerBytes, headerBytes.Count() + BufferSize);
+                            }
+                            prevLfFlag = lfFlag;
+                        }
+                    } while(!endOfHeaders);
+                } catch (SocketException ex) {
+                    WriteLine($"  {ex.SocketErrorCode}");//ex.Message);
+                } finally {
+                    socket?.Dispose();
                 }
-                WriteLine("{0} HTTP Server '{1}'", url, ResponseObject.Server);
-                serverList.Add(address.ToString(), ResponseObject.Server);
-                /*
-                if(ResponseObject.Headers["Server"].StartsWith("binarflow", true, null)) {
-                    serverAddresses.Add(address);
-                    WriteLine("Detected Binarflow device '{0}', URL {1}", ResponseObject.Headers["Server"], url);
-                    //continue;
+                string server;
+                if(headers.TryGetValue("Server", out server)) {
+                    serverList.Add(address.ToString(), server);
                 }
-                */
-                //    HeaderList.Add(HeaderKey, ResponseObject.Headers[HeaderKey]);
-                ResponseObject.Close();
             }
+            WriteLine();
             return serverList;
-/*
-            // And output them:
-            foreach (string HeaderKey in Headers.Keys) 
-                WriteLine("{0}: {1}", HeaderKey, Headers[HeaderKey]);
-*/
          }
 
         static void WriteLine(string format = null, params object[] arg) {
