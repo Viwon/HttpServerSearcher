@@ -207,21 +207,26 @@ namespace HttpServerSearcher {
             string request;
             byte[] recievedBytes = new byte[BufferSize];
             byte[] headerBytes = new byte[BufferSize];
-            IPEndPoint endPoint = new IPEndPoint(0, 80);
             WriteLine("{0} addresses addresses will be checked on HTTP...", addresses.Count);
             foreach (IPAddress address in addresses) {
                 WriteLine($"{address}:");
                 request = String.Format("{0} / HTTP/1.1\r\nHost: {1}\r\nConnection: close\r\n\r\n", "GET", address);
-                endPoint.Address = address;
                 Socket socket = null;
                 string startLine = null;
                 Dictionary<string, string> headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                 try {
                     // Connect to host
                     socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                    socket.Connect(endPoint);
                     socket.SendTimeout = Timeout;
                     socket.ReceiveTimeout = Timeout;
+                    IAsyncResult result = socket.BeginConnect(address, 80, null, null);
+                    if(result.AsyncWaitHandle.WaitOne(Timeout, true)) {
+                        socket.EndConnect(result);
+                    }
+                    result.AsyncWaitHandle.Dispose();
+                    if(!socket.Connected) {
+                        throw new SocketException((int)SocketError.TimedOut);
+                    }
                     // Send request
                     socket.Send(System.Text.Encoding.ASCII.GetBytes(request));
                     // Get response
