@@ -5,13 +5,14 @@ using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Threading;
 using System.Linq;// .ToList()
+using System.Text.RegularExpressions;
 using CommandLine;
 
 namespace HttpServerSearcher {
+
     class Program {
 
         const int ThreadsLimit = 50;
-        const int BufferSize = 256;
         public static bool IsVerbose = false;
         public static int Timeout = 100;
 
@@ -204,99 +205,29 @@ namespace HttpServerSearcher {
 
         public static Dictionary<string, string> HttpCheck(List<IPAddress> addresses) {
             Dictionary<string, string> serverList = new Dictionary<string, string>();
-            string request;
-            byte[] recievedBytes = new byte[BufferSize];
-            byte[] headerBytes = new byte[BufferSize];
             WriteLine("{0} addresses addresses will be checked on HTTP...", addresses.Count);
+            HTTPHeaders httpHeaders = new HTTPHeaders(Timeout);
             foreach (IPAddress address in addresses) {
                 WriteLine($"{address}:");
-                request = String.Format("{0} / HTTP/1.1\r\nHost: {1}\r\nConnection: close\r\n\r\n", "GET", address);
-                Socket socket = null;
-                string startLine = null;
-                Dictionary<string, string> headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                try {
-                    // Connect to host
-                    socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                    socket.SendTimeout = Timeout;
-                    socket.ReceiveTimeout = Timeout;
-                    IAsyncResult result = socket.BeginConnect(address, 80, null, null);
-                    if(result.AsyncWaitHandle.WaitOne(Timeout, true)) {
-                        socket.EndConnect(result);
-                    }
-                    result.AsyncWaitHandle.Dispose();
-                    if(!socket.Connected) {
-                        throw new SocketException((int)SocketError.TimedOut);
-                    }
-                    // Send request
-                    socket.Send(System.Text.Encoding.ASCII.GetBytes(request));
-                    // Get response
-                    bool endOfHeaders = false;// Message header has received
-                    bool wsFlag = false;//  Current byte is White Space
-                    bool crFlag = false;// Current byte is Carriage Return
-                    bool lfFlag = false;// Current byte is LineFeed
-                    bool ctlFlag = false;// Current byte is control character
-                    bool prevLfFlag = false;// Previous byte is LineFeed
-                    int headerLen = 0;
-                    do {
-                        int total = socket.Receive(recievedBytes);
-                        for(int i = 0; i < total; i++) {
-                            wsFlag = recievedBytes[i] == ' ' || recievedBytes[i] == '\t';
-                            crFlag = recievedBytes[i] == '\r';
-                            lfFlag = recievedBytes[i] == '\n';
-                            ctlFlag = (recievedBytes[i] >= 0 && recievedBytes[i] <= 31) || recievedBytes[i] == 127;
-                            if(ctlFlag && !(crFlag || lfFlag)) {
-                                //throw new WebException(null, null, WebExceptionStatus.ServerProtocolViolation, null);
-                            }
-                            // If the line starts with a space, this is a multi-line header, skip to the true end
-                            if(prevLfFlag && !wsFlag) {
-                                if(headerLen == 0) {
-                                    endOfHeaders = true;
-                                    break;
-                                }
-                                string line = System.Text.Encoding.ASCII.GetString(headerBytes, 0, headerLen);
-                                WriteLine($"  {line}");
-                                headerLen = 0;
-                                if(startLine == null) {
-                                    startLine = line;
-                                } else {
-                                    int colonPos = line.IndexOf(':');
-                                    if(colonPos == -1) {
-                                        //throw new WebException(null, null, WebExceptionStatus.ServerProtocolViolation, null);
-                                    } else {
-                                        string name = line.Substring(0, colonPos).Trim();
-                                        string value = line.Substring(colonPos + 1).Trim();
-                                        
-                                        if(headers.ContainsKey(name)) {// multiple header
-                                            headers[name] += "," + value;
-                                        } else {
-                                            headers.Add(name, value);
-                                        }
-                                    }
-                                }
-                            }
-                            if(!ctlFlag) {
-                                headerBytes[headerLen++] = recievedBytes[i];
-                            }
-                            if(headerLen >= headerBytes.Count()) {
-                                Array.Resize(ref headerBytes, headerBytes.Count() + BufferSize);
-                            }
-                            prevLfFlag = lfFlag;
+                if(httpHeaders.Request(address.ToString())){
+                    WriteLine($"  {httpHeaders.StartLine}");
+                    if(IsVerbose) {
+                        foreach(KeyValuePair<string, string> header in httpHeaders.Headers) {
+                            Console.WriteLine("  {0}: {1}", header.Key, header.Value);
                         }
-                    } while(!endOfHeaders);
-                } catch (SocketException ex) {
-                    WriteLine($"  {ex.SocketErrorCode}");//ex.Message);
-                } finally {
-                    socket?.Dispose();
-                }
-                string server;
-                if(headers.TryGetValue("Server", out server)) {
-                    serverList.Add(address.ToString(), server);
+                    }
+                    string server;
+                    if(httpHeaders.Headers.TryGetValue("Server", out server)) {
+                        serverList.Add(address.ToString(), server);
+                    }
+                } else {
+                     WriteLine($"  {httpHeaders.Error}");
                 }
             }
             WriteLine();
             return serverList;
-         }
-
+        }
+        
         static void WriteLine(string format = null, params object[] arg) {
             if(IsVerbose) {
                 if(format != null) {
@@ -305,6 +236,139 @@ namespace HttpServerSearcher {
                     Console.WriteLine();
                 }
             }
+        }
+    }
+
+    class HTTPHeaders {
+        
+        const int BufferSize = 256;
+        const int MaxFieldSize = 1024;
+        private int _timeout;
+        private byte[] _recievedBytes;
+        private byte[] _headerBytes;
+        private string _error;
+        private string _address;
+        private string _startLine;
+        private Dictionary<string, string> _headers;
+
+        public Dictionary<string, string> Headers { get => _headers; }
+        public string Address { get => _address; }
+        public string StartLine { get => _startLine; }
+        public string Error { get => _error; }
+
+        public HTTPHeaders(int Timeout = 100) {
+            _timeout = Timeout;
+            _recievedBytes = new byte[BufferSize];
+            _headerBytes = new byte[BufferSize];
+        }
+
+        public bool Request(string ipString) {
+            IPAddress address;
+            if(!IPAddress.TryParse(ipString, out address))
+                throw new ArgumentOutOfRangeException(nameof(ipString));
+            _address = address.ToString();
+            _error = null;
+            _startLine = null;
+            _headers = null;
+            string request = String.Format("{0} / HTTP/1.1\r\nHost: {1}\r\nConnection: close\r\n\r\n", "GET", _address);
+            Socket socket = null;
+            bool endOfHeaders = false;// Message header has received
+            bool wsFlag = false;//  Current byte is White Space
+            bool crFlag = false;// Current byte is Carriage Return
+            bool lfFlag = false;// Current byte is LineFeed
+            bool ctlFlag = false;// Current byte is control character
+            bool prevLfFlag = false;// Previous byte is LineFeed
+            int colonPos = -1;// Position of the colon in the field
+            int headerLen = 0;
+            try {
+                // Connect to host
+                socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                socket.SendTimeout = _timeout;
+                socket.ReceiveTimeout = _timeout;
+                IAsyncResult result = socket.BeginConnect(address, 80, null, null);
+                if(result.AsyncWaitHandle.WaitOne(_timeout, true)) {
+                    socket.EndConnect(result);
+                }
+                result.AsyncWaitHandle.Dispose();
+                if(!socket.Connected) {
+                    throw new SocketException((int)SocketError.TimedOut);
+                }
+                // Send request
+                socket.Send(System.Text.Encoding.ASCII.GetBytes(request));
+                // Get response
+                do {
+                    int total = socket.Receive(_recievedBytes);
+                    for(int i = 0; i < total; i++) {
+                        wsFlag = _recievedBytes[i] == ' ' || _recievedBytes[i] == '\t';
+                        crFlag = _recievedBytes[i] == '\r';
+                        lfFlag = _recievedBytes[i] == '\n';
+                        ctlFlag = (_recievedBytes[i] >= 0 && _recievedBytes[i] <= 31) || _recievedBytes[i] == 127;
+                        if(ctlFlag && !(crFlag || lfFlag)) {// Response message contain a control character
+                            _error = "ServerProtocolViolation";
+                            break;
+                        }
+                        // If the line starts with a space, this is a multi-line header, skip to the true end
+                        if(prevLfFlag && !wsFlag) {
+                            if(headerLen == 0) {
+                                endOfHeaders = true;
+                                break;
+                            }
+                            string line = System.Text.Encoding.ASCII.GetString(_headerBytes, 0, headerLen);
+//                            WriteLine($"  {line}");
+                            if(_startLine == null) {
+                                _startLine = line;
+                                Match match = Regex.Match(_startLine, @"\AHTTP/(\d+\.\d+) (\d{3}) ([^\x00-\x1F\x7F]*)\Z", RegexOptions.IgnoreCase);
+                                if(!match.Success) {// Response start line has an invalid format
+                                    _error = "ServerProtocolViolation";
+                                    break;
+                                }
+                            } else {
+                                //int colonPos = line.IndexOf(':');
+                                if(colonPos == -1) {// The header field does not contain a colon
+                                    _error = "ServerProtocolViolation";
+                                    break;
+                                } else {
+                                    if(_headers == null) {
+                                        _headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                                    }
+                                    string name = line.Substring(0, colonPos).Trim();
+                                    string value = line.Substring(colonPos + 1).Trim();
+                                    
+                                    if(_headers.ContainsKey(name)) {// multiple header
+                                        _headers[name] += "," + value;
+                                    } else {
+                                        _headers.Add(name, value);
+                                    }
+                                }
+                            }
+                            colonPos = -1;
+                            headerLen = 0;
+                        }
+                        if(!ctlFlag) {
+                            if(_recievedBytes[i] == ':' && colonPos == -1) {
+                                colonPos = headerLen;
+                            }
+                            _headerBytes[headerLen++] = _recievedBytes[i];
+                        }
+                        if(headerLen == MaxFieldSize) {// The header field is larger than the maximum buffer size
+                            _error = "MessageLengthLimitExceeded";
+                        }
+                        if(headerLen >= _headerBytes.Count()) {
+                            Array.Resize(ref _headerBytes, _headerBytes.Count() + BufferSize);
+                        }
+                        prevLfFlag = lfFlag;
+                    }
+                } while(!endOfHeaders && _error == null);
+            } catch(SocketException ex) {
+                if(headerLen != 0) {// Receive time out, the end of the headers is not reached
+                    _error = "ReceiveFailure";
+                } else {
+                    _error = ex.SocketErrorCode.ToString();//ex.Message;
+                }
+            } finally {
+                socket?.Dispose();
+            }
+            return _error == null;
         }
     }
 }
