@@ -23,12 +23,12 @@ HttpServerSearcher [<ADDRESSES>] [-t <TIMEOUT>] [-v]
 where
 * -t - specifies ICMP/HTTP requests timeout, at millisecond (Default: 100).
 * -v - specifies operate in verbose mode.
-* <ADDRESSES> - specifies the IP addresses to scan, the following formats are available:
+* \<ADDRESSES\> - specifies the IP addresses to scan, the following formats are available:
   - X.X.X.X - single IP address, X.X.X.X
   - X.X.X.X-Y.Y.Y.Y - IP address range, from X.X.X.X to Y.Y.Y.Y, inclusive
   - X.X.X.X+YYYYY - series of IP addresses, X.X.X.X IP address, and another Y IP addresses following it
   - X.X.X.X/YY - all IP addresses of a subnet that includes an X.X.X.X address and has a YY prefix
-  - if <ADDRESSES> is omitted, all addresses of available local networks will be scanned 
+  - if \<ADDRESSES\> is omitted, all addresses of available local networks will be scanned 
 
 ### Example
 ```sh
