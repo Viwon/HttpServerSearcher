@@ -11,7 +11,7 @@
             "preLaunchTask": "build",
             // If you have changed target frameworks, make sure to update the program path.
             "program": "${workspaceFolder}/bin/Debug/netcoreapp3.1/HttpServerSearcher.dll",
-            "args": ["-v -t 50"],
+            "args": ["-v", "-t 50", "172.16.0.1", "172.16.1.133", "172.16.19.0/24", "172.16.0.70+9", "172.16.1.10-172.16.1.30"],
             "cwd": "${workspaceFolder}",
             // For more information about the 'console' field, see https://aka.ms/VSCode-CS-LaunchJson-Console
             "console": "internalConsole",

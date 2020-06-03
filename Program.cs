@@ -26,28 +26,34 @@ namespace HttpServerSearcher {
 /*
             [Option('s', "server", Default = "*", HelpText = "HTTP server header for search.")]
             public string Server { get; set; }
-
+*/
             [Value(0, MetaName = "Addresses", HelpText = "IP addresses for scan.")]
             public IEnumerable<string> Addresses { get; set;}
-*/
+
         }
 
         static void Main(string[] args) {
-            //var a = "-v".Split();
             Options settings = null;
+            List<IPAddress> addresses = null;
             var parse = Parser.Default.ParseArguments<Options>(args)
                 .WithParsed<Options>(options => { settings = options;}
             );
             if(parse is NotParsed<Options>) {
                 return;
             }
-
+            
             IsVerbose = settings.Verbose;
             Timeout = settings.Timeout;
+            if(settings.Addresses.Count() != 0) {
+                addresses = StringsToIp4List(settings.Addresses);
+                if(addresses == null) {
+                    Console.WriteLine("Addresses parsing error.");
+                    return;
+                }
+            } else {
+                addresses = GetIPAddresses();
+            }
 
-            List<IPAddress> addresses = GetIPAddresses();
-            //List<IPAddress> addresses = new List<IPAddress>();
-            //addresses.Add(IPAddress.Parse("172.16.0.1"));
             var totalIPs = addresses.Count;
             if(totalIPs == 0) {
                 Console.WriteLine("No polling addresses found.");
@@ -59,7 +65,7 @@ namespace HttpServerSearcher {
             foreach(KeyValuePair<string, string> server in serverList) {
                 Console.WriteLine("http://{0}: {1}", server.Key, server.Value);
             }
-         }
+        }
 
         public static List<IPAddress> GetIPAddresses() {
             List<IPAddress> scanAddresses = new List<IPAddress>();
@@ -124,17 +130,17 @@ namespace HttpServerSearcher {
                         //WriteLine("     Subnet mask .......................... : {0}", uipi.IPv4Mask);
                         //WriteLine("     Prefix Length ........................ : {0}", uipi.PrefixLength);
                         
-                        bytes = uipi.Address.GetAddressBytes();
-                        UInt32 hostAddress = (UInt32)IPAddress.NetworkToHostOrder(BitConverter.ToInt32(bytes, 0));
-                        bytes = uipi.IPv4Mask.GetAddressBytes();
-                        UInt32 netMask = (UInt32)IPAddress.NetworkToHostOrder(BitConverter.ToInt32(bytes, 0));
-                        UInt32 networkAddress = hostAddress & netMask;
-                        UInt32 broadcastAddress = networkAddress ^ ~netMask;
-                        // Перебераем все адреса подсети, кроме адреса самой сити и широковещательного
-                        for (var address = networkAddress + 1; address < broadcastAddress; address++) {
-                            var tmp  = IPAddress.HostToNetworkOrder((Int32)address);
-                            bytes = BitConverter.GetBytes(tmp);
-                            scanAddresses.Add(new IPAddress(bytes));
+                        UInt32 hostAddress = (UInt32)Ip4ToInt32(uipi.Address);
+                        UInt32 netMask = (UInt32)Ip4ToInt32(uipi.IPv4Mask);
+                        UInt32 begAddress = hostAddress & netMask;// networkAddress
+                        UInt32 endAddress = begAddress ^ ~netMask;// broadcastAddress
+                        // Skip network and broadcast addresses
+                        if(!uipi.IPv4Mask.Equals(IPAddress.Parse("255.255.255.255")) && !uipi.IPv4Mask.Equals(IPAddress.Parse("255.255.255.254"))) {
+                            begAddress++;
+                            endAddress--;
+                        }
+                        for (var address = begAddress; address <= endAddress; address++) {
+                            scanAddresses.Add(Int32ToIp4((Int32)address));
                         }
                     } else if (uipi.Address.AddressFamily == AddressFamily.InterNetworkV6) {
                         if(prefixLength < 0) {
@@ -205,7 +211,7 @@ namespace HttpServerSearcher {
 
         public static Dictionary<string, string> HttpCheck(List<IPAddress> addresses) {
             Dictionary<string, string> serverList = new Dictionary<string, string>();
-            WriteLine("{0} addresses addresses will be checked on HTTP...", addresses.Count);
+            WriteLine("{0} addresses will be checked on HTTP...", addresses.Count);
             HTTPHeaders httpHeaders = new HTTPHeaders(Timeout);
             foreach (IPAddress address in addresses) {
                 WriteLine($"{address}:");
@@ -226,6 +232,54 @@ namespace HttpServerSearcher {
             }
             WriteLine();
             return serverList;
+        }
+
+        public static List<IPAddress> StringsToIp4List(in IEnumerable<string> ipStrings) {
+            List<IPAddress> addresses = new List<IPAddress>();
+            Regex ipRegex = new Regex(@"^(?<base>(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d))(?:(?(-)-(?<end>(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d))|(?(\+)\+(?<amount>\d{1,5})|(?(/)/(?<prefix>(?:3[0-2]|[1-2]?\d))|))))?$");
+
+            foreach(string ipString in ipStrings) {
+                Match match = ipRegex.Match(ipString);
+                if(!match.Success) {
+                    WriteLine("Option '{0}' is defined with a bad format.", ipString);
+                    return null;
+                }
+                UInt32 begAddress = (UInt32)Ip4ToInt32(IPAddress.Parse(match.Groups["base"].Value));
+                UInt32 endAddress = begAddress;
+                if(match.Groups["end"].Success) {
+                    endAddress = (UInt32)(UInt32)Ip4ToInt32(IPAddress.Parse(match.Groups["end"].Value));
+                } else if(match.Groups["prefix"].Success) {
+                    UInt32 prefix = UInt32.Parse(match.Groups["prefix"].Value);
+                    UInt32 shift = 32 - prefix;
+                    UInt32 netMask = UInt32.MaxValue;
+                    // Make network mask from prefix
+                    for(var i = 0; i < shift; i++) {
+                        netMask = netMask << 1;
+                    }
+                    begAddress = begAddress & netMask;// Network address
+                    endAddress = begAddress ^ ~netMask;// Broadcast address
+                    // Exclude the network and broadcast addresses from the scan list for networks with a prefix other than 31/32
+                    if(!(prefix == 31 || prefix == 32)) {
+                        begAddress++;
+                        endAddress--;
+                    }
+                } else if(match.Groups["amount"].Success) {
+                    endAddress = begAddress + UInt32.Parse(match.Groups["amount"].Value);
+                }
+
+                for(var address = begAddress; address <= endAddress; address++) {
+                    addresses.Add(Int32ToIp4((Int32)address));
+                }
+            }
+            return addresses.Distinct().ToList();
+        }
+
+        public static Int32 Ip4ToInt32(in IPAddress ipAddress) {
+            return IPAddress.NetworkToHostOrder(BitConverter.ToInt32(ipAddress.GetAddressBytes(), 0));
+        }
+
+        public static IPAddress Int32ToIp4(in Int32 intAddress) {
+            return new IPAddress(BitConverter.GetBytes(IPAddress.HostToNetworkOrder(intAddress)));
         }
         
         static void WriteLine(string format = null, params object[] arg) {
@@ -317,7 +371,7 @@ namespace HttpServerSearcher {
 //                            WriteLine($"  {line}");
                             if(_startLine == null) {
                                 _startLine = line;
-                                Match match = Regex.Match(_startLine, @"\AHTTP/(\d+\.\d+) (\d{3}) ([^\x00-\x1F\x7F]*)\Z", RegexOptions.IgnoreCase);
+                                Match match = Regex.Match(_startLine, @"\AHTTP/\d+\.\d+ \d{3} [^\x00-\x1F\x7F]*\Z", RegexOptions.IgnoreCase);
                                 if(!match.Success) {// Response start line has an invalid format
                                     _error = "ServerProtocolViolation";
                                     break;
