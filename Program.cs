@@ -4,6 +4,7 @@ using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Linq;// .ToList()
 using System.Text.RegularExpressions;
 using CommandLine;
@@ -23,10 +24,10 @@ namespace HttpServerSearcher {
 
             [Option('t', "timeout", Default = 100, HelpText = "ICMP/HTTP request timeout, millisecond.")]
             public int Timeout { get; set; }
-/*
-            [Option('s', "server", Default = "*", HelpText = "HTTP server header for search.")]
-            public string Server { get; set; }
-*/
+
+            [Option('h', "header", Default = "", HelpText = "HTTP server header for search.")]
+            public string Header { get; set; }
+
             [Value(0, MetaName = "Addresses", HelpText = "IP addresses for scan.")]
             public IEnumerable<string> Addresses { get; set;}
 
@@ -44,6 +45,13 @@ namespace HttpServerSearcher {
             
             IsVerbose = settings.Verbose;
             Timeout = settings.Timeout;
+            if(!String.IsNullOrEmpty(settings.Header)) {
+                settings.Header = settings.Header.Trim();
+                if(String.IsNullOrEmpty(settings.Header) || settings.Header.IndexOf(' ') != -1) {
+                    Console.WriteLine("Header parsing error.");
+                    return;
+                }
+            }
             if(settings.Addresses.Count() != 0) {
                 addresses = StringsToIp4List(settings.Addresses);
                 if(addresses == null) {
@@ -61,21 +69,32 @@ namespace HttpServerSearcher {
             }
             addresses = IcmpCheck(addresses);
             var serverList = HttpCheck(addresses);
-            Console.WriteLine("{0} IP addresses were polled/ {1} replied to the ICMP-request/ {2} responded to the HTTP-request.", totalIPs, addresses.Count, serverList.Count);
-            foreach(KeyValuePair<string, string> server in serverList) {
+            SortedDictionary<string, string> sortedList = new SortedDictionary<string,string>();
+            foreach (var httpHeaders in serverList) {
+                bool searchedServer = true;
+                string fieldValue = httpHeaders.StartLine;
+                if(!String.IsNullOrEmpty(settings.Header)) {
+                    searchedServer = httpHeaders.Headers.TryGetValue(settings.Header, out fieldValue);
+                }
+                if(searchedServer) {
+                    sortedList.Add(httpHeaders.Address, fieldValue);
+                }
+            }
+            Console.WriteLine($"{totalIPs} IP addresses were polled/ {addresses.Count} replied to the ICMP-request/ {serverList.Count} responded to the HTTP-request/ {sortedList.Count} filtered by header.");
+            foreach(KeyValuePair<string, string> server in sortedList) {
                 Console.WriteLine("http://{0}: {1}", server.Key, server.Value);
             }
         }
 
         public static List<IPAddress> GetIPAddresses() {
-            List<IPAddress> scanAddresses = new List<IPAddress>();
+            List<IPAddress> addresses = new List<IPAddress>();
             IPGlobalProperties computerProperties = IPGlobalProperties.GetIPGlobalProperties();
             NetworkInterface[] nics = NetworkInterface.GetAllNetworkInterfaces();
             WriteLine("Interface information for {0}.{1}     ",
                     computerProperties.HostName, computerProperties.DomainName);
             if (nics == null || nics.Length < 1) {
                 WriteLine("  No network interfaces found.");
-                return scanAddresses;
+                return addresses;
             }
 
             WriteLine("  Number of interfaces .................... : {0}", nics.Length);
@@ -140,7 +159,7 @@ namespace HttpServerSearcher {
                             endAddress--;
                         }
                         for (var address = begAddress; address <= endAddress; address++) {
-                            scanAddresses.Add(Int32ToIp4((Int32)address));
+                            addresses.Add(Int32ToIp4((Int32)address));
                         }
                     } else if (uipi.Address.AddressFamily == AddressFamily.InterNetworkV6) {
                         if(prefixLength < 0) {
@@ -157,12 +176,7 @@ namespace HttpServerSearcher {
                 }
             }
             WriteLine();
-            return scanAddresses.Distinct().ToList();
-        }
-
-        public static List<IPAddress> GetIPAddresses(string strAddresses) {
-            List<IPAddress> listAddresses = new List<IPAddress>();
-            return listAddresses;
+            return addresses.Distinct().ToList();
         }
 
         public static List<IPAddress> IcmpCheck(List<IPAddress> addresses) {
@@ -190,7 +204,7 @@ namespace HttpServerSearcher {
                     }
                     lock(repliedLock) {
                         remainingAddresses--;
-                        if(success) replied.Add(e.Reply.Address);
+                        if(success) replied.Add((IPAddress)e.UserState);
                     }
                     // Let the main thread resume.
                     pool.Release();
@@ -209,28 +223,26 @@ namespace HttpServerSearcher {
             return replied;
         }
 
-        public static Dictionary<string, string> HttpCheck(List<IPAddress> addresses) {
-            Dictionary<string, string> serverList = new Dictionary<string, string>();
+        public static List<HTTPHeaders> HttpCheck(List<IPAddress> addresses) {
+            List<HTTPHeaders> serverList = new List<HTTPHeaders>();
             WriteLine("{0} addresses will be checked on HTTP...", addresses.Count);
-            HTTPHeaders httpHeaders = new HTTPHeaders(Timeout);
-            foreach (IPAddress address in addresses) {
-                WriteLine($"{address}:");
-                if(httpHeaders.Request(address.ToString())){
-                    WriteLine($"  {httpHeaders.StartLine}");
+            //Parallel.ForEach(addresses, address => {
+            foreach(IPAddress address in addresses) {
+                 HTTPHeaders httpHeaders = new HTTPHeaders(Timeout);
+                if(httpHeaders.Request(address.ToString())) {
                     if(IsVerbose) {
+                        Console.WriteLine($"{address}:");
+                        Console.WriteLine($"  {httpHeaders.StartLine}");
                         foreach(KeyValuePair<string, string> header in httpHeaders.Headers) {
                             Console.WriteLine("  {0}: {1}", header.Key, header.Value);
                         }
                     }
-                    string server;
-                    if(httpHeaders.Headers.TryGetValue("Server", out server)) {
-                        serverList.Add(address.ToString(), server);
-                    }
+                    serverList.Add(httpHeaders);
                 } else {
-                     WriteLine($"  {httpHeaders.Error}");
+                    WriteLine($"{address}:");
+                    WriteLine($"  {httpHeaders.Error}");
                 }
-            }
-            WriteLine();
+            }//);
             return serverList;
         }
 
@@ -298,8 +310,6 @@ namespace HttpServerSearcher {
         const int BufferSize = 256;
         const int MaxFieldSize = 1024;
         private int _timeout;
-        private byte[] _recievedBytes;
-        private byte[] _headerBytes;
         private string _error;
         private string _address;
         private string _startLine;
@@ -312,8 +322,6 @@ namespace HttpServerSearcher {
 
         public HTTPHeaders(int Timeout = 100) {
             _timeout = Timeout;
-            _recievedBytes = new byte[BufferSize];
-            _headerBytes = new byte[BufferSize];
         }
 
         public bool Request(string ipString) {
@@ -323,9 +331,11 @@ namespace HttpServerSearcher {
             _address = address.ToString();
             _error = null;
             _startLine = null;
-            _headers = null;
+            _headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             string request = String.Format("{0} / HTTP/1.1\r\nHost: {1}\r\nConnection: close\r\n\r\n", "GET", _address);
             Socket socket = null;
+            byte[] recievedBytes = new byte[BufferSize];
+            byte[] headerBytes = new byte[BufferSize];
             bool endOfHeaders = false;// Message header has received
             bool wsFlag = false;//  Current byte is White Space
             bool crFlag = false;// Current byte is Carriage Return
@@ -339,6 +349,8 @@ namespace HttpServerSearcher {
                 socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
                 socket.SendTimeout = _timeout;
                 socket.ReceiveTimeout = _timeout;
+                //socket.Connect(address, 80);
+                
                 IAsyncResult result = socket.BeginConnect(address, 80, null, null);
                 if(result.AsyncWaitHandle.WaitOne(_timeout, true)) {
                     socket.EndConnect(result);
@@ -347,16 +359,17 @@ namespace HttpServerSearcher {
                 if(!socket.Connected) {
                     throw new SocketException((int)SocketError.TimedOut);
                 }
+                
                 // Send request
                 socket.Send(System.Text.Encoding.ASCII.GetBytes(request));
                 // Get response
                 do {
-                    int total = socket.Receive(_recievedBytes);
+                    int total = socket.Receive(recievedBytes);
                     for(int i = 0; i < total; i++) {
-                        wsFlag = _recievedBytes[i] == ' ' || _recievedBytes[i] == '\t';
-                        crFlag = _recievedBytes[i] == '\r';
-                        lfFlag = _recievedBytes[i] == '\n';
-                        ctlFlag = (_recievedBytes[i] >= 0 && _recievedBytes[i] <= 31) || _recievedBytes[i] == 127;
+                        wsFlag = recievedBytes[i] == ' ' || recievedBytes[i] == '\t';
+                        crFlag = recievedBytes[i] == '\r';
+                        lfFlag = recievedBytes[i] == '\n';
+                        ctlFlag = (recievedBytes[i] >= 0 && recievedBytes[i] <= 31) || recievedBytes[i] == 127;
                         if(ctlFlag && !(crFlag || lfFlag)) {// Response message contain a control character
                             _error = "ServerProtocolViolation";
                             break;
@@ -367,7 +380,7 @@ namespace HttpServerSearcher {
                                 endOfHeaders = true;
                                 break;
                             }
-                            string line = System.Text.Encoding.ASCII.GetString(_headerBytes, 0, headerLen);
+                            string line = System.Text.Encoding.ASCII.GetString(headerBytes, 0, headerLen);
 //                            WriteLine($"  {line}");
                             if(_startLine == null) {
                                 _startLine = line;
@@ -382,9 +395,6 @@ namespace HttpServerSearcher {
                                     _error = "ServerProtocolViolation";
                                     break;
                                 } else {
-                                    if(_headers == null) {
-                                        _headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                                    }
                                     string name = line.Substring(0, colonPos).Trim();
                                     string value = line.Substring(colonPos + 1).Trim();
                                     
@@ -399,16 +409,16 @@ namespace HttpServerSearcher {
                             headerLen = 0;
                         }
                         if(!ctlFlag) {
-                            if(_recievedBytes[i] == ':' && colonPos == -1) {
+                            if(recievedBytes[i] == ':' && colonPos == -1) {
                                 colonPos = headerLen;
                             }
-                            _headerBytes[headerLen++] = _recievedBytes[i];
+                            headerBytes[headerLen++] = recievedBytes[i];
                         }
                         if(headerLen == MaxFieldSize) {// The header field is larger than the maximum buffer size
                             _error = "MessageLengthLimitExceeded";
                         }
-                        if(headerLen >= _headerBytes.Count()) {
-                            Array.Resize(ref _headerBytes, _headerBytes.Count() + BufferSize);
+                        if(headerLen >= headerBytes.Count()) {
+                            Array.Resize(ref headerBytes, headerBytes.Count() + BufferSize);
                         }
                         prevLfFlag = lfFlag;
                     }
